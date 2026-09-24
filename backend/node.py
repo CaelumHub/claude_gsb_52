@@ -117,6 +117,8 @@ class Node:
             if status == "extended":
                 included = {tx.txid for tx in candidates}
                 self.txpool.remove_many(included)
+                # Account nonces advanced: promote any queued future-nonce txs.
+                self.txpool.promote(self.blockchain.state)
                 self.save_txpool()
                 self._record_events(self.blockchain.last_receipts, block.index)
                 self.sync_contract_files()
@@ -160,6 +162,9 @@ class Node:
 
     def pending_transactions(self):
         return self.txpool.ordered_all()
+
+    def queued_transactions(self):
+        return self.txpool.queued_all()
 
     def contract_events(self, address):
         return read_json(self.paths.contract_path(address), {}).get("events", [])
@@ -236,6 +241,8 @@ class Node:
         if status == "extended":
             included = {tx.txid for tx in block.transactions}
             self.txpool.remove_many(included)
+            # Account nonces advanced: promote any queued future-nonce txs.
+            self.txpool.promote(self.blockchain.state)
             self.save_txpool()
             self._record_events(self.blockchain.last_receipts, block.index)
             self.sync_contract_files()
@@ -253,10 +260,11 @@ class Node:
         return ok, reason
 
     def _readmit_abandoned(self):
-        for blk in self.blockchain.last_abandoned:
-            for tx in blk.transactions:
-                if not tx.is_coinbase():
-                    self.txpool.re_admit([tx])
+        transactions = [tx
+                        for blk in self.blockchain.last_abandoned
+                        for tx in blk.transactions
+                        if not tx.is_coinbase()]
+        self.txpool.re_admit(transactions, self.blockchain.state)
         self.save_txpool()
 
     def _record_events(self, receipts, height):

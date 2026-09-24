@@ -19,7 +19,8 @@
 
       <div class="grid cols-4">
         <div class="card stat accent"><div class="label">待确认交易</div>
-          <div class="value" id="poolCount">—</div></div>
+          <div class="value" id="poolCount">—</div>
+          <div class="small muted" id="queuedInline" style="margin-top:4px;"></div></div>
         <div class="card stat green"><div class="label">当前区块高度</div>
           <div class="value" id="height">—</div></div>
         <div class="card stat amber"><div class="label">当前难度</div>
@@ -67,6 +68,12 @@
           <button class="btn ghost sm" onclick="refreshPool()">刷新</button>
         </div>
         <div id="poolList" class="table-wrap" style="margin-top:12px;"></div>
+        <div id="queuedWrap" style="margin-top:16px;">
+          <h3 style="margin:0 0 8px;">排队中 <span class="hint" id="queuedHint"></span></h3>
+          <div class="hint" style="margin-bottom:8px;">
+            这些交易 Nonce 靠前序交易，常见于区块回滚/分叉重组后；前序交易重新打包后会自动进入主交易池，不会丢失。</div>
+          <div id="queuedList" class="table-wrap"></div>
+        </div>
       </div>
     </main>
   </div>
@@ -95,7 +102,9 @@ async function loadWallets() {
 async function refreshPool() {
   const d = await API.get("/api/txpool");
   const s = await API.get("/api/node/status");
+  const queued = d.queued || [];
   $("#poolCount").textContent = d.count;
+  $("#queuedInline").textContent = queued.length ? `另有 ${queued.length} 条排队中` : "";
   $("#height").textContent = "#" + s.height;
   $("#difficulty").textContent = s.difficulty;
   $("#hashrate").textContent = Math.round(s.hashrate).toLocaleString();
@@ -103,21 +112,33 @@ async function refreshPool() {
   const box = $("#poolList");
   if (!d.count) {
     box.innerHTML = `<div class="empty"><div class="big">🗂</div>交易池为空</div>`;
-    return;
+  } else {
+    box.innerHTML = tableHtml(d.transactions, false);
   }
-  box.innerHTML = `<table><thead><tr>
-    <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th></th></tr></thead>
-    <tbody>${d.transactions.map(t => `
+  $("#queuedHint").textContent = `（${queued.length} 条）`;
+  const qbox = $("#queuedList");
+  qbox.innerHTML = queued.length ? tableHtml(queued, true) : "";
+  $("#queuedWrap").style.display = queued.length ? "" : "none";
+}
+
+function txRowsHtml(list, queued) {
+  return list.map(t => `
       <tr>
         <td class="hash" title="${esc(t.txid)}">${fmt.hash(t.txid, 8)}</td>
-        <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
+        <td><span class="badge ${queued ? "amber" : "blue"}">${queued ? "排队中 · " : ""}${fmt.shortType(t.type)}</span></td>
         <td class="addr">${fmt.addr(t.sender, 6)}</td>
         <td class="addr">${t.to ? fmt.addr(t.to, 6) : "—"}</td>
         <td class="mono-num">${fmt.amount(t.amount)}</td>
         <td class="mono-num">${fmt.amount(t.fee)}</td>
         <td class="mono-num">${t.nonce}</td>
         <td><button class="btn ghost sm" onclick="removeTx('${t.txid}')">移除</button></td>
-      </tr>`).join("")}</tbody></table>`;
+      </tr>`).join("");
+}
+
+function tableHtml(list, queued) {
+  return `<table><thead><tr>
+    <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th></th></tr></thead>
+    <tbody>${txRowsHtml(list, queued)}</tbody></table>`;
 }
 
 async function submitTransfer() {

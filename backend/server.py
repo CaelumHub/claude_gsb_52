@@ -241,9 +241,12 @@ def create_app(node):
     @app.get("/api/txpool")
     def txpool():
         txs = node.pending_transactions()
+        queued = node.queued_transactions()
         return _json({
             "count": len(txs),
+            "queued_count": len(queued),
             "transactions": [tx.to_dict() for tx in txs],
+            "queued": [tx.to_dict() for tx in queued],
         })
 
     @app.get("/api/txpool/<txid>")
@@ -553,15 +556,19 @@ def create_app(node):
             height = int(data.get("height", 0))
         except (TypeError, ValueError):
             return _json({"ok": False, "error": "invalid height"}, 400)
-        # Re-admit transactions from blocks being rolled back.
-        abandoned_blocks = node.blockchain.chain[height + 1:]
+        # Re-admit transactions from blocks being rolled back.  Capture them
+        # before the chain is truncated and hand them over in one batch: when
+        # one sender has transactions in several rolled-back blocks, only the
+        # first matches the reset account nonce; the rest must be queued by the
+        # pool instead of being rejected as "sender already pending".
+        abandoned_txs = [tx
+                         for blk in node.blockchain.chain[height + 1:]
+                         for tx in blk.transactions
+                         if not tx.is_coinbase()]
         ok, msg = node.blockchain.rollback(height)
         if not ok:
             return _json({"ok": False, "error": msg}, 400)
-        for blk in abandoned_blocks:
-            for tx in blk.transactions:
-                if not tx.is_coinbase():
-                    node.txpool.re_admit([tx])
+        node.txpool.re_admit(abandoned_txs, node.blockchain.state)
         node.save_txpool()
         node.sync_contract_files()
         node.log("warn", f"admin rollback to height {height}")
