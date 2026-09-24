@@ -5,16 +5,17 @@ mined.  It enforces:
 
 * signature validity,
 * sender authenticity (public key must match the sender address),
-* nonce monotonicity (only the *next* nonce per sender is admitted, preventing
-  nonce gaps and making double-spends structurally impossible),
-* sufficient balance against the current world state,
+* nonce continuity (a sender may have a queue of consecutive nonces, preventing
+  gaps and making double-spends structurally impossible),
+* sufficient balance against the current world state plus queued transactions,
 * fee >= 0 and a bounded pool size.
 
-When a block is mined, included transactions are dropped; on a reorg, the
-transactions from abandoned blocks are re-admitted so they are not lost.
+When a block is mined, included transactions are dropped; on a reorg or an
+administrative rollback, the transactions from abandoned blocks are re-admitted
+so they are not lost.  Each sender may have multiple queued transactions; only
+the transactions that are executable with the current account nonce/balance are
+packed into a block.
 """
-
-import time
 
 from .config import TXPOOL_SORT_KEY
 from .transaction import Transaction
@@ -23,9 +24,9 @@ from .transaction import Transaction
 class TxPool:
     def __init__(self, max_size=1000):
         self.max_size = max_size
-        self._pool = {}          # txid -> Transaction
-        self._order = []         # txids in arrival order
-        self._by_sender = {}     # sender -> txid (one pending tx per sender)
+        self._pool = {}              # txid -> Transaction
+        self._order = []             # txids in arrival order
+        self._by_sender = {}         # sender -> {nonce: txid}
 
     # ------------------------------------------------------------------ #
     # Access
@@ -45,6 +46,35 @@ class TxPool:
     def all(self):
         return [self._pool[t] for t in self._order]
 
+    def ready_all(self, world_state):
+        """Return executable transactions in pool arrival order.
+
+        A later transaction from one sender cannot be packed before the prior
+        nonce has executed, and balance checks must account for the preceding
+        queued transactions.  Walking the arrival order once therefore yields a
+        valid block candidate list while preserving fairness between senders.
+        """
+        nonces = {}
+        balances = {}
+        ready = []
+        for tx in self.all():
+            sender = tx.sender
+            current_nonce = nonces.get(
+                sender, world_state.nonce(sender))
+            if tx.nonce != current_nonce:
+                continue
+
+            balance = balances.get(sender, world_state.balance(sender))
+            cost = tx.fee + (tx.amount if tx.tx_type in ("transfer", "call")
+                             else 0.0)
+            if balance < cost:
+                continue
+
+            ready.append(tx)
+            nonces[sender] = current_nonce + 1
+            balances[sender] = balance - cost
+        return ready
+
     def ordered_all(self):
         """Transactions listed for the UI in display order."""
         return sorted(self.all(),
@@ -56,6 +86,32 @@ class TxPool:
     # ------------------------------------------------------------------ #
     # Validation
     # ------------------------------------------------------------------ #
+    def _queued_nonces(self, sender):
+        return set(self._by_sender.get(sender, {}))
+
+    def _next_nonce(self, sender, world_state):
+        """First nonce not already occupied by this sender's queued txs."""
+        nonce = world_state.nonce(sender)
+        queued = self._queued_nonces(sender)
+        while nonce in queued:
+            nonce += 1
+        return nonce
+
+    def _pending_cost(self, sender, world_state, exclude_txid=None):
+        """Total balance reserved by the sender's contiguous queued prefix."""
+        nonce = world_state.nonce(sender)
+        queued = self._by_sender.get(sender, {})
+        cost = 0.0
+        while nonce in queued:
+            txid = queued[nonce]
+            if txid != exclude_txid:
+                tx = self._pool[txid]
+                cost += tx.fee
+                if tx.tx_type in ("transfer", "call"):
+                    cost += tx.amount
+            nonce += 1
+        return cost
+
     def validate(self, tx, world_state):
         """Return ``(ok, reason)`` for admitting ``tx`` into the pool."""
         if not isinstance(tx, Transaction):
@@ -68,24 +124,31 @@ class TxPool:
             return False, "invalid signature"
         if tx.derived_sender() != tx.sender:
             return False, "sender does not match public key"
-        if tx.sender in self._by_sender:
-            return False, "sender already has a pending transaction"
         if tx.fee < 0 or tx.amount < 0:
             return False, "negative fee or amount"
-        expected_nonce = world_state.nonce(tx.sender)
+
+        queued = self._queued_nonces(tx.sender)
+        if tx.nonce in queued:
+            return False, f"nonce {tx.nonce} already has a pending transaction"
+        expected_nonce = self._next_nonce(tx.sender, world_state)
         if tx.nonce != expected_nonce:
             return False, (f"nonce {tx.nonce} != expected {expected_nonce} "
-                           f"(account nonce)")
+                           f"(next account nonce)")
+
+        required = self._pending_cost(tx.sender, world_state) + tx.fee
         if tx.tx_type == "transfer":
             if not tx.to:
                 return False, "transfer requires a recipient"
-            if world_state.balance(tx.sender) < tx.amount + tx.fee:
+            required += tx.amount
+            available = world_state.balance(tx.sender)
+            if available < required:
                 return False, "insufficient balance"
         elif tx.tx_type == "deploy":
-            if world_state.balance(tx.sender) < tx.fee:
+            if world_state.balance(tx.sender) < required:
                 return False, "insufficient balance for deploy fee"
         elif tx.tx_type == "call":
-            if world_state.balance(tx.sender) < tx.amount + tx.fee:
+            required += tx.amount
+            if world_state.balance(tx.sender) < required:
                 return False, "insufficient balance for call"
         else:
             return False, f"unknown transaction type '{tx.tx_type}'"
@@ -94,28 +157,55 @@ class TxPool:
     # ------------------------------------------------------------------ #
     # Mutations
     # ------------------------------------------------------------------ #
-    def add(self, tx):
+    def add(self, tx, force=False):
+        """Add a transaction to the pool.
+
+        ``force`` is used when restoring transactions from rolled-back blocks:
+        those transactions are already consensus history and must not be lost to
+        the pool's normal capacity limit.
+        """
         if tx.txid in self._pool:
             return False
-        if tx.sender in self._by_sender and tx.sender not in (None, ""):
+        if tx.is_coinbase():
             return False
-        if self.size() >= self.max_size:
-            # Evict the oldest transaction to stay within bounds.
-            oldest = self._order.pop(0)
-            evicted = self._pool.pop(oldest, None)
-            if evicted is not None:
-                self._by_sender.pop(evicted.sender, None)
+        if not force and tx.sender not in (None, ""):
+            queued = self._by_sender.get(tx.sender, {})
+            if tx.nonce in queued:
+                return False
+
+        if not force and self.size() >= self.max_size:
+            if not self._evict_for(tx):
+                return False
+
         self._pool[tx.txid] = tx
         self._order.append(tx.txid)
         if tx.sender:
-            self._by_sender[tx.sender] = tx.txid
+            self._by_sender.setdefault(tx.sender, {})[tx.nonce] = tx.txid
         return True
+
+    def _evict_for(self, tx):
+        """Make room for ``tx`` without splitting a sender's nonce queue."""
+        # Prefer to evict the oldest transaction belonging to another sender.
+        for txid in list(self._order):
+            candidate = self._pool[txid]
+            if candidate.sender != tx.sender:
+                self.remove(txid)
+                return True
+
+        # If every queued transaction belongs to this sender, evicting one would
+        # create a nonce gap.  Restored transactions bypass the cap via force;
+        # normal submissions must wait for the queued prefix to be mined.
+        return False
 
     def remove(self, txid):
         if txid in self._pool:
             tx = self._pool.pop(txid, None)
             if tx is not None and tx.sender:
-                self._by_sender.pop(tx.sender, None)
+                queued = self._by_sender.get(tx.sender)
+                if queued is not None:
+                    queued.pop(tx.nonce, None)
+                    if not queued:
+                        self._by_sender.pop(tx.sender, None)
             if txid in self._order:
                 self._order.remove(txid)
             return True
@@ -131,10 +221,25 @@ class TxPool:
         self._by_sender.clear()
 
     def re_admit(self, transactions):
-        """Re-add transactions (e.g. from an abandoned fork block)."""
-        for tx in transactions:
-            if tx.txid not in self._pool and not tx.is_coinbase():
-                self.add(tx)
+        """Re-add transactions from abandoned/rolled-back blocks.
+
+        Blocks are walked from lowest height to highest height, but callers may
+        also pass a flat list.  Sort each sender's transactions by nonce so a
+        multi-block sequence such as nonces 0, 1, 2 is restored in executable
+        order.  Restored transactions bypass normal admission validation and the
+        size cap because they came from valid blocks and must not be silently
+        discarded.
+        """
+        txs = [tx for tx in transactions if not tx.is_coinbase()]
+        txs.sort(key=lambda tx: (tx.sender, tx.nonce))
+        added = []
+        for tx in txs:
+            queued = self._by_sender.get(tx.sender, {})
+            if tx.txid in self._pool or tx.nonce in queued:
+                continue
+            if self.add(tx, force=True):
+                added.append(tx)
+        return added
 
     # ------------------------------------------------------------------ #
     # Persistence
@@ -144,7 +249,8 @@ class TxPool:
 
     def load(self, data, world_state):
         self.clear()
-        for d in data or []:
-            tx = Transaction.from_dict(d)
+        txs = [Transaction.from_dict(d) for d in (data or [])]
+        txs.sort(key=lambda tx: (tx.sender, tx.nonce))
+        for tx in txs:
             if self.validate(tx, world_state)[0]:
-                self.add(tx)
+                self.add(tx, force=True)

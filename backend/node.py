@@ -92,7 +92,8 @@ class Node:
         with self._lock:
             miner = miner_address or (self.wallets.list()[0]["address"]
                                       if self.wallets.list() else ZERO_ADDRESS)
-            candidates = self.txpool.all()[:MAX_TX_PER_BLOCK]
+            candidates = self.txpool.ready_all(
+                self.blockchain.state)[:MAX_TX_PER_BLOCK]
             index = self.blockchain.height + 1
             coinbase = create_coinbase(miner, COINBASE_REWARD, index)
             txs = [coinbase] + candidates
@@ -252,12 +253,40 @@ class Node:
         ok, reason = self.submit_transaction(tx, broadcast=True)
         return ok, reason
 
-    def _readmit_abandoned(self):
-        for blk in self.blockchain.last_abandoned:
+    def readmit_blocks(self, blocks, conflicting_blocks=()):
+        """Re-admit non-coinbase transactions from abandoned blocks.
+
+        Transactions already represented in ``conflicting_blocks`` (the blocks
+        that replace them during a reorg) are not restored: either the exact
+        transaction was retained on the winning branch, or another transaction
+        consumed the same sender/nonce.
+        """
+        occupied = set()
+        replacement_txids = set()
+        for blk in conflicting_blocks:
             for tx in blk.transactions:
+                replacement_txids.add(tx.txid)
                 if not tx.is_coinbase():
-                    self.txpool.re_admit([tx])
+                    occupied.add((tx.sender, tx.nonce))
+        self.txpool.remove_many(replacement_txids)
+
+        transactions = []
+        for blk in blocks:
+            for tx in blk.transactions:
+                if (not tx.is_coinbase()
+                        and (tx.sender, tx.nonce) not in occupied):
+                    transactions.append(tx)
+        added = self.txpool.re_admit(transactions)
         self.save_txpool()
+        return added
+
+    def _readmit_abandoned(self):
+        abandoned = self.blockchain.last_abandoned
+        if not abandoned:
+            return
+        ancestor_height = abandoned[0].index - 1
+        replacements = self.blockchain.chain[ancestor_height + 1:]
+        self.readmit_blocks(abandoned, replacements)
 
     def _record_events(self, receipts, height):
         """Append contract events from ``receipts`` to per-contract files."""

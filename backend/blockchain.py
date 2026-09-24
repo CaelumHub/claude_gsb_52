@@ -395,9 +395,11 @@ class Blockchain:
         if not os.path.exists(self.paths.state_path(target_height)):
             return False, "no state snapshot at target height"
         state_data = read_json(self.paths.state_path(target_height))
+        abandoned = self.chain[target_height + 1:]
         self.state = WorldState.from_dict(state_data)
         self.chain = self.chain[:target_height + 1]
         self.chainwork = self.cumulative_work_of(self.chain)
+        self.last_abandoned = list(abandoned)
         self._delete_block_files_above(target_height)
         self._write_meta()
         self.versions.record(target_height, self.head.hash)

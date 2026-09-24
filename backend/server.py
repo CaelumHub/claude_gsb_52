@@ -553,19 +553,14 @@ def create_app(node):
             height = int(data.get("height", 0))
         except (TypeError, ValueError):
             return _json({"ok": False, "error": "invalid height"}, 400)
-        # Re-admit transactions from blocks being rolled back.
-        abandoned_blocks = node.blockchain.chain[height + 1:]
         ok, msg = node.blockchain.rollback(height)
         if not ok:
             return _json({"ok": False, "error": msg}, 400)
-        for blk in abandoned_blocks:
-            for tx in blk.transactions:
-                if not tx.is_coinbase():
-                    node.txpool.re_admit([tx])
-        node.save_txpool()
+        readmitted = node.readmit_blocks(node.blockchain.last_abandoned)
         node.sync_contract_files()
         node.log("warn", f"admin rollback to height {height}")
-        return _json({"ok": True, "message": msg, "height": height})
+        return _json({"ok": True, "message": msg, "height": height,
+                      "readmitted": len(readmitted)})
 
     @app.post("/api/admin/reset")
     def admin_reset():
